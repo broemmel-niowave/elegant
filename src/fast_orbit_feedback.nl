@@ -18,6 +18,15 @@
     STRING inverse[2] = {NULL, NULL};
     STRING response[4] = {NULL, NULL, NULL, NULL};
     long invert_response = 0;
+    long fixed_length_matrix = 0;
+    long use_response_from_computed_orbits = 0;
+    double closed_orbit_accuracy = 1e-12;
+    double closed_orbit_accuracy_requirement = 1e-7;
+    long closed_orbit_iterations = 40;
+    double closed_orbit_iteration_fraction = 0.9;
+    double closed_orbit_fraction_multiplier = 1.05;
+    double closed_orbit_multiplier_interval = 5;
+    long closed_orbit_tracking_turns = 0;
     long keep_largest_SVs = 0;
     long remove_smallest_SVs = 0;
     double minimum_SV_ratio = 0;

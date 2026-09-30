@@ -374,6 +374,7 @@ static void setupPlane(FOFB_PLANE *plane, long coord, RUN *run, LINE_LIST *beaml
   CORMON_DATA *CM;
   STEERING_LIST *SL;
   long i, found = 0, idx = (coord == 0) ? 0 : 1, rfActive;
+  unsigned long flags;
   char *item;
 
   memset(plane, 0, sizeof(*plane));
@@ -423,7 +424,12 @@ static void setupPlane(FOFB_PLANE *plane, long coord, RUN *run, LINE_LIST *beaml
   /* SV / inversion controls consumed by compute_orbcor_matrices */
   CM->nmon = CM->ncor = 0;
   CM->C = CM->T = NULL;
-  CM->fixed_length = CM->fixed_length_matrix = 0;
+  /* fixed_length is the correction-time orbit model (unused: FOFB tracks the beam and
+     never runs a closed-orbit correction step). fixed_length_matrix selects the orbit
+     model used to build the response matrix (0 vary RF frequency, 1 vary energy,
+     2 full 6-D); honored by both the analytic and computed-orbit builders below. */
+  CM->fixed_length = 0;
+  CM->fixed_length_matrix = fixed_length_matrix;
   CM->auto_limit_SVs = 1;
   CM->keep_largest_SVs = keep_largest_SVs;
   CM->remove_smallest_SVs = remove_smallest_SVs;
@@ -433,8 +439,38 @@ static void setupPlane(FOFB_PLANE *plane, long coord, RUN *run, LINE_LIST *beaml
 
   /* When the RF actuator is active we append its column before inverting, so defer
      the inversion; otherwise invert here exactly as increment 1. */
-  compute_orbcor_matrices(CM, SL, coord, run, beamline,
-                          (rfActive ? 0 : COMPUTE_RESPONSE_INVERT) | (verbosity < 2 ? COMPUTE_RESPONSE_SILENT : 0), 0);
+  flags = (rfActive ? 0 : COMPUTE_RESPONSE_INVERT) | (verbosity < 2 ? COMPUTE_RESPONSE_SILENT : 0);
+  if (use_response_from_computed_orbits) {
+    /* Build the response matrix by tweaking each corrector and differencing perturbed
+       closed orbits (mirrors &correct use_response_from_computed_orbits). Reuse the
+       serial per-plane builder compute_orbcor_matrices1 on all ranks: it is compiled
+       unconditionally, matrix-based (single test particle) for closed_orbit_tracking_turns=0,
+       and MPI-safe run redundantly -- the batched compute_orbcor_matrices1p does both
+       planes in one collective call, incompatible with FOFB's per-plane + x-only RF-append
+       flow. A local CORRECTION carries only the closed-orbit knobs and this plane's CM/SL. */
+    CORRECTION corrTmp;
+    memset(&corrTmp, 0, sizeof(corrTmp));
+    corrTmp.clorb_accuracy = closed_orbit_accuracy;
+    corrTmp.clorb_accuracy_requirement = closed_orbit_accuracy_requirement;
+    corrTmp.clorb_iterations = closed_orbit_iterations;               /* struct field is double */
+    corrTmp.clorb_iter_fraction = closed_orbit_iteration_fraction;
+    corrTmp.clorb_fraction_multiplier = closed_orbit_fraction_multiplier;
+    corrTmp.clorb_multiplier_interval = closed_orbit_multiplier_interval; /* struct field is short */
+    corrTmp.clorb_track_for_orbit = closed_orbit_tracking_turns;      /* struct field is short */
+    corrTmp.rpn_store_response_matrix = 0;
+    /* shallow struct copy: SL's pointer members are read-only during response
+       computation, and corrTmp is never freed. */
+    if (coord == 0) {
+      corrTmp.CMFx = CM;
+      corrTmp.SLx = *SL;
+    } else {
+      corrTmp.CMFy = CM;
+      corrTmp.SLy = *SL;
+    }
+    compute_orbcor_matrices1(&corrTmp, coord, run, beamline, flags, 0, NULL, NULL);
+  } else {
+    compute_orbcor_matrices(CM, SL, coord, run, beamline, flags, 0);
+  }
 
   if (CM->nmon == 0) {
     plane->active = 0;
@@ -516,6 +552,25 @@ void setupFastOrbitFeedback(NAMELIST_TEXT *nltext, RUN *run, VARY *control, LINE
 
   if (output_interval < 1)
     output_interval = 1;
+
+  /* response-matrix orbit model (mirrors &correct fixed_length_matrix guards) */
+  if (fixed_length_matrix < 0 || fixed_length_matrix > 2)
+    bombElegant("fixed_length_matrix must be 0 (vary RF frequency), 1 (vary energy, momentum secant), or 2 (full 6-D closed orbit).", NULL);
+  if (fixed_length_matrix == 1 && checkChangeT(beamline))
+    bombElegant("change_t is nonzero on one or more RF cavities. This is incompatible with fixed_length_matrix=1 orbit computations.", NULL);
+  if (fixed_length_matrix && include_rf_frequency)
+    printWarning("fast_orbit_feedback: fixed_length_matrix is set together with include_rf_frequency.",
+                 "The RF-frequency actuator moves the orbit by varying the RF frequency, which is inconsistent with a fixed-length response matrix. Use fixed_length_matrix=0 (variable-length, vary-RF-frequency model) or disable include_rf_frequency.");
+  if (use_response_from_computed_orbits) {
+    if (closed_orbit_accuracy <= 0)
+      bombElegant("closed_orbit_accuracy must be > 0", NULL);
+    if (closed_orbit_accuracy_requirement <= 0)
+      bombElegant("closed_orbit_accuracy_requirement must be > 0", NULL);
+    if (closed_orbit_iteration_fraction <= 0 || closed_orbit_iteration_fraction > 1)
+      bombElegant("closed_orbit_iteration_fraction must be on (0, 1]", NULL);
+    if (closed_orbit_iterations <= 0)
+      bombElegant("closed_orbit_iterations <= 0", NULL);
+  }
 
   /* stash the closed-orbit-start flags for elegant.c to act on before tracking */
   fofbCenterOnOrbitFlag = center_on_orbit;
