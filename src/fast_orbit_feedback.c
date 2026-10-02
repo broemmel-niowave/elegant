@@ -32,6 +32,15 @@
  * residual horizontal drift.  Which cavities are driven is selected through
  * &steering_element target=fofb, item=FREQ (else every RFCA is auto-discovered).
  *
+ * A third, independent actuator is the RF-PHASE energy loop (include_rf_phase,
+ * energy_Kp/Ki/Kd): a STANDALONE scalar loop (not a response-matrix column) that deduces
+ * the common (mode-0) energy offset from the horizontal BPMs by dispersion projection
+ * delta_est=sum(x_i*eta_i)/sum(eta_i^2) and nulls it by modulating the main-RF phase.
+ * Run fast (step << synchrotron period) it damps the energy oscillation directly -- the
+ * fast counterpart to the slow frequency radial loop.  subtract_dispersion feeds the x
+ * steering solve the betatron-only residual so it can drop the long synchrotron boxcar.
+ * Cavities are selected through &steering_element target=fofb, item=PHASE.
+ *
  * See fast_orbit_feedback.nl for the namelist and the plan file for the full
  * design rationale.
  */
@@ -71,8 +80,10 @@ long add_steer_elem_to_lists(STEERING_LIST *SL, long plane, char *name, char *it
    dedicated correctors / all RFCAs when a class is not declared). */
 static STEERING_LIST fofbSL[2];
 static STEERING_LIST fofbRFsl;
+static STEERING_LIST fofbRFPhasesl;
 static long fofbSLDeclared[2] = {0, 0};
 static long fofbRFDeclared = 0;
+static long fofbRFPhaseDeclared = 0;
 
 /* Copies of the closed-orbit-start namelist flags, set in setupFastOrbitFeedback and
    read by elegant.c (through the accessors below) to center/offset the beam on the
@@ -90,7 +101,8 @@ long fofbOffsetMomentumAlso(void) { return fofbOffsetMomentumAlsoFlag; }
 /* ------------------------------------------------------------------ */
 /* FOFB-owned steering-element intake: routed here from add_steering_element when a
    &steering_element command sets target="fast_orbit_feedback".  item=FREQ selects
-   RF cavities (the joint RF-frequency knob); anything else is a plane corrector. */
+   RF cavities for the joint RF-frequency knob; item=PHASE selects RF cavities for the
+   RF-phase energy actuator (a separate scalar loop); anything else is a plane corrector. */
 
 long fofbAddSteerElem(long plane, char *name, char *item, char *element_type, double tweek, double limit,
                       long start_occurence, long end_occurence, long occurence_step,
@@ -102,6 +114,12 @@ long fofbAddSteerElem(long plane, char *name, char *item, char *element_type, do
                                     beamline, run, 0, verbose);
     if (found)
       fofbRFDeclared = 1;
+  } else if (item && strcmp(item, "PHASE") == 0) {
+    found = add_steer_elem_to_lists(&fofbRFPhasesl, plane, name, item, element_type, tweek, limit,
+                                    start_occurence, end_occurence, occurence_step, s_start, s_end,
+                                    beamline, run, 0, verbose);
+    if (found)
+      fofbRFPhaseDeclared = 1;
   } else {
     long idx = (plane == 2) ? 1 : 0;
     found = add_steer_elem_to_lists(&fofbSL[idx], plane, name, item ? item : (idx ? "VKICK" : "HKICK"),
@@ -143,6 +161,12 @@ typedef struct {
   IIRFILTER *xFilter, *yFilter; /* independent IIR banks (own state) for this BPM */
   long nxFilter, nyFilter;
   double xTick, yTick; /* running filtered readout (value at the last turn = the tick) */
+  /* separate x-filter for the RF-frequency loop (x/dispersive plane only): the frequency
+     integrator must average over the synchrotron period (notch f_s) while steering keeps a
+     short bpm_filter_file; populated only when rf_bpm_filter_file is set. */
+  IIRFILTER *xFilterRF;
+  long nxFilterRF;
+  double xTickRF; /* running RF-loop filtered readout; == raw reading when no RF bank */
 } FOFB_BPM_DATA;
 
 /* per-plane control state, all arrays indexed by corrector 0..CM.ncor-1 */
@@ -171,6 +195,23 @@ typedef struct {
   double *rfBaseFreq;  /* each selected cavity's base frequency (Hz) */
   long *rfFreqOffset;  /* offset of FREQ within each cavity's p_elem */
   long nRF;            /* number of selected RF cavities */
+  /* RF-phase energy actuator (x/dispersive plane only): a standalone scalar loop,
+     NOT a response-matrix column.  The common (mode-0) energy offset is deduced from
+     the BPMs by dispersion projection delta_est=sum(x_i*eta_i)/sum(eta_i^2) and nulled
+     by modulating the main-RF phase (energy kick), without touching phase_fiducial. */
+  long rfPhaseActive;         /* nonzero when include_rf_phase drives this plane */
+  ELEMENT_LIST **rfPhaseElem; /* selected RFCA cavities whose PHASE is modulated */
+  double *rfBasePhase;        /* each cavity's base PHASE (deg) */
+  long *rfPhaseOffset;        /* offset of PHASE within each cavity's p_elem */
+  long nRFPhase;              /* number of selected cavities */
+  double energyKp, energyKi, energyKd; /* scalar PID gains on delta_est */
+  double phaseScale;          /* deg of RF phase per unit delta_est (signed) */
+  double phaseCmd;            /* current commanded phase offset (deg), held over a step */
+  double lastPhaseApplied;    /* last phase offset physically written (deg) */
+  double ePhaseAcc;           /* PID integral accumulator */
+  double ePhasePrev;          /* previous delta_est (derivative term) */
+  double deltaEst;            /* last dispersion-projected energy offset (for output) */
+  short phasePegged;          /* nonzero while phaseCmd is clamped at rf_phase_limit */
 } FOFB_PLANE;
 
 static FOFB_PLANE planeData[2]; /* [0]=x, [1]=y */
@@ -183,6 +224,7 @@ static long fofbSetupDone = 0;
 static SDDS_DATASET SDDS_fofb;
 static long fofbOutputActive = 0;
 static long fofbHasDfrfColumn = 0;
+static long fofbHasPhaseColumns = 0;
 
 /* master-only guard for output under MPI */
 #if USE_MPI
@@ -252,6 +294,9 @@ static void attachMonitorData(FOFB_PLANE *plane) {
       bd->xFilter = loadFilterBank(bpm_filter_file, &bd->nxFilter);
     if (plane->coord == 2 && !bd->yFilter)
       bd->yFilter = loadFilterBank(bpm_filter_file, &bd->nyFilter);
+    /* dedicated BPM filter for the RF-frequency loop (x plane only) */
+    if (plane->coord == 0 && include_rf_frequency && rf_bpm_filter_file && !bd->xFilterRF)
+      bd->xFilterRF = loadFilterBank(rf_bpm_filter_file, &bd->nxFilterRF);
   }
 }
 
@@ -369,8 +414,110 @@ static void appendRFActuator(FOFB_PLANE *plane, RUN *run, LINE_LIST *beamline) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Resolve and cache the cavity list driven by the RF-phase energy actuator, and
+   compute the phase-per-delta scale.  This is a STANDALONE scalar loop -- it does NOT
+   append a response-matrix column (unlike appendRFActuator).  Called only for the x
+   (dispersive) plane when include_rf_phase is set.  Mirrors appendRFActuator's cavity
+   discovery (declared entries, else auto-add every RFCA). */
 
-static void setupPlane(FOFB_PLANE *plane, long coord, RUN *run, LINE_LIST *beamline) {
+static void setupPhaseActuator(FOFB_PLANE *plane, RUN *run, VARY *control, LINE_LIST *beamline) {
+  long k;
+  double voltScaled, cosPhiS, phiS;
+  RFCA *rfca0;
+
+  /* resolve the cavity list: declared entries, else auto-add every RFCA (mutable
+     copies required -- add_steer_elem_to_lists uppercases its args in place). */
+  if (!fofbRFPhaseDeclared || fofbRFPhasesl.n_corr_types == 0) {
+    char *anyName, *phaseItem, *rfcaType;
+    cp_str(&anyName, "*");
+    cp_str(&phaseItem, "PHASE");
+    cp_str(&rfcaType, "RFCA");
+    if (!add_steer_elem_to_lists(&fofbRFPhasesl, 0, anyName, phaseItem, rfcaType, 1e-6, 0,
+                                 0, 0, 1, -1, -1, beamline, run, 0, verbosity > 1))
+      bombElegant("fast_orbit_feedback: include_rf_phase set but no RFCA cavities found", NULL);
+    free(anyName);
+    free(phaseItem);
+    free(rfcaType);
+  }
+  plane->nRFPhase = fofbRFPhasesl.n_corr_types;
+
+  plane->rfPhaseElem = tmalloc(sizeof(*plane->rfPhaseElem) * plane->nRFPhase);
+  plane->rfBasePhase = tmalloc(sizeof(*plane->rfBasePhase) * plane->nRFPhase);
+  plane->rfPhaseOffset = tmalloc(sizeof(*plane->rfPhaseOffset) * plane->nRFPhase);
+  for (k = 0; k < plane->nRFPhase; k++) {
+    plane->rfPhaseElem[k] = fofbRFPhasesl.elem[k];
+    plane->rfPhaseOffset[k] = fofbRFPhasesl.param_offset[k];
+    plane->rfBasePhase[k] = *((double *)(fofbRFPhasesl.elem[k]->p_elem + fofbRFPhasesl.param_offset[k]));
+  }
+
+  plane->energyKp = energy_Kp;
+  plane->energyKi = energy_Ki;
+  plane->energyKd = energy_Kd;
+  plane->phaseCmd = 0;
+  plane->lastPhaseApplied = 0; /* offset relative to base; base is written at pass 0 */
+  plane->ePhaseAcc = plane->ePhasePrev = plane->deltaEst = 0;
+  plane->phasePegged = 0;
+
+  /* phaseScale: deg of RF phase per unit energy offset delta.  energy_response_scale,
+     if given, is authoritative (signed, user-calibrated).  Otherwise form the analytic
+     estimate -(180/pi)*pCentral/(n_passes*voltScaled*cos phi_s), where voltScaled matches
+     the dgamma=volt*sin(phase) convention of simple_rfca.c (volt in gamma units) and
+     pCentral is gamma0.  The analytic SIGN can be wrong (it depends on sign(cos phi_s) and
+     above/below transition, and the true phi_s = phase_fiducial + rfca->phase, with
+     phase_fiducial not yet known at setup), so it is a convenience default only. */
+  rfca0 = (RFCA *)(plane->rfPhaseElem[0]->p_elem);
+  if (energy_response_scale != 0) {
+    plane->phaseScale = energy_response_scale;
+  } else {
+    voltScaled = rfca0->volt / (1e6 * particleMassMV * particleRelSign);
+    phiS = rfca0->phase * PI / 180.0;
+    cosPhiS = cos(phiS);
+    if (voltScaled != 0 && cosPhiS != 0 && control->n_passes > 0)
+      plane->phaseScale = -(180.0 / PI) * run->p_central /
+                          ((double)control->n_passes * voltScaled * cosPhiS);
+    else
+      plane->phaseScale = 0;
+    printWarning("fast_orbit_feedback: using an analytic estimate for the RF-phase energy "
+                 "response scale.",
+                 "Its sign may be wrong (it anti-damps if so).  Set energy_response_scale "
+                 "explicitly (deg per unit delta) after calibrating with a short run.");
+  }
+
+  /* efficacy warning: a phase offset held across a step loses its energy-damping action
+     once the beam begins to re-phase, i.e. once the step spans a sizable fraction of the
+     synchrotron period.  Estimate nu_s from the standard formula and warn if the step is
+     long compared with it.  Best-effort only (skipped silently if the estimate is not a
+     sane positive number). */
+  {
+    double h, Eev, nus2, Tsynch;
+    h = rfca0->freq * beamline->revolution_length / c_mks; /* beta ~ 1 */
+    Eev = run->p_central * particleMassMV * 1e6;
+    nus2 = (Eev > 0) ? beamline->alpha[0] * h * rfca0->volt * fabs(cos(rfca0->phase * PI / 180.0)) /
+                         (PIx2 * Eev)
+                     : 0;
+    if (nus2 > 0) {
+      Tsynch = 1.0 / sqrt(nus2);
+      if (control->n_passes > Tsynch / 5.0)
+        printWarning("fast_orbit_feedback: the RF-phase actuator step is long compared with "
+                     "the synchrotron period.",
+                     "n_passes exceeds ~T_synch/5; a held phase offset loses energy-damping "
+                     "efficacy as the beam re-phases.  Use a faster loop (smaller n_passes).");
+    }
+  }
+
+  plane->rfPhaseActive = 1;
+
+  if (verbosity)
+    printf("fast_orbit_feedback: RF-phase energy actuator active over %ld cavity(ies), "
+           "phaseScale=%.6e deg/delta%s\n",
+           plane->nRFPhase, plane->phaseScale,
+           energy_response_scale != 0 ? " (user)" : " (analytic)");
+  fflush(stdout);
+}
+
+/* ------------------------------------------------------------------ */
+
+static void setupPlane(FOFB_PLANE *plane, long coord, RUN *run, VARY *control, LINE_LIST *beamline) {
   CORMON_DATA *CM;
   STEERING_LIST *SL;
   long i, found = 0, idx = (coord == 0) ? 0 : 1, rfActive;
@@ -531,6 +678,10 @@ static void setupPlane(FOFB_PLANE *plane, long coord, RUN *run, LINE_LIST *beaml
   plane->rfKi = rf_Ki;
   plane->rfKd = rf_Kd;
 
+  /* RF-phase energy actuator rides on the x (dispersive) plane's active BPM set */
+  if (coord == 0 && include_rf_phase)
+    setupPhaseActuator(plane, run, control, beamline);
+
   attachMonitorData(plane);
 
   if (verbosity)
@@ -561,6 +712,26 @@ void setupFastOrbitFeedback(NAMELIST_TEXT *nltext, RUN *run, VARY *control, LINE
   if (fixed_length_matrix && include_rf_frequency)
     printWarning("fast_orbit_feedback: fixed_length_matrix is set together with include_rf_frequency.",
                  "The RF-frequency actuator moves the orbit by varying the RF frequency, which is inconsistent with a fixed-length response matrix. Use fixed_length_matrix=0 (variable-length, vary-RF-frequency model) or disable include_rf_frequency.");
+  /* The RF-frequency column folds the dispersive signal eta*delta INTO the x solve;
+     subtract_dispersion REMOVES exactly that signal from the x solve.  The two are the
+     complementary halves of the energy channel -- use one or the other, never both. */
+  if (subtract_dispersion && include_rf_frequency)
+    bombElegant("fast_orbit_feedback: subtract_dispersion and include_rf_frequency are mutually exclusive "
+                "(the frequency column needs the eta*delta signal that subtract_dispersion removes). "
+                "Use the RF-phase energy loop (include_rf_phase) with subtract_dispersion for a fast energy "
+                "channel, or include_rf_frequency alone for the slow radial loop.", NULL);
+  /* rf_bpm_filter_file gives the RF-frequency loop its own BPM filter (to notch the
+     synchrotron line that destabilizes the frequency integrator at any gain) -- it only
+     has meaning for that loop. */
+  if (rf_bpm_filter_file && !include_rf_frequency)
+    bombElegant("fast_orbit_feedback: rf_bpm_filter_file is set but include_rf_frequency is 0. "
+                "The dedicated RF-loop BPM filter only applies to the RF-frequency actuator; "
+                "enable include_rf_frequency or remove rf_bpm_filter_file.", NULL);
+  if (subtract_dispersion && !include_rf_phase)
+    printWarning("fast_orbit_feedback: subtract_dispersion is set without include_rf_phase.",
+                 "The dispersive energy offset is subtracted from the x steering solve but no actuator "
+                 "corrects it; the common energy error will persist.  Enable include_rf_phase (or "
+                 "include_rf_frequency without subtract_dispersion) to act on it.");
   if (use_response_from_computed_orbits) {
     if (closed_orbit_accuracy <= 0)
       bombElegant("closed_orbit_accuracy must be > 0", NULL);
@@ -594,11 +765,16 @@ void setupFastOrbitFeedback(NAMELIST_TEXT *nltext, RUN *run, VARY *control, LINE
                  "Add target=\"fofb\" to the &steering_element commands so their correctors drive the feedback; "
                  "otherwise those definitions are ignored and the feedback auto-discovers dedicated correctors.");
 
-  setupPlane(&planeData[0], 0, run, beamline);
-  setupPlane(&planeData[1], 2, run, beamline);
+  setupPlane(&planeData[0], 0, run, control, beamline);
+  setupPlane(&planeData[1], 2, run, control, beamline);
 
   if (!planeData[0].active && !planeData[1].active)
     bombElegant("fast_orbit_feedback: no active correction plane (no monitors and/or correctors found)", NULL);
+
+  if (include_rf_phase && !planeData[0].rfPhaseActive)
+    bombElegant("fast_orbit_feedback: include_rf_phase is set but the x plane is inactive (no monitors). "
+                "The RF-phase energy actuator rides on the horizontal BPM set; declare H correctors "
+                "(or include_rf_frequency) so the x plane is built.", NULL);
 
   /* diagnostic output setup (master only) */
   fofbOutputActive = 0;
@@ -659,12 +835,27 @@ void setupFastOrbitFeedback(NAMELIST_TEXT *nltext, RUN *run, VARY *control, LINE
       SDDS_SetError("Unable to set up fast_orbit_feedback DeltaFrf column");
       SDDS_PrintErrors(stderr, SDDS_VERBOSE_PrintErrors | SDDS_EXIT_PrintErrors);
     }
+    /* RF-phase energy-actuator diagnostics exist only when include_rf_phase is set, so
+       include_rf_phase=0 runs keep the output layout unchanged */
+    if (include_rf_phase &&
+        (SDDS_DefineColumn(&SDDS_fofb, "DeltaPhase", NULL, "deg",
+                           "Applied RF-phase offset from the base phase at this iteration "
+                           "(one common offset shared by all selected cavities), the energy actuator command",
+                           NULL, SDDS_DOUBLE, 0) < 0 ||
+         SDDS_DefineColumn(&SDDS_fofb, "deltaEnergyEst", NULL, NULL,
+                           "Dispersion-projected common energy offset sum(x_i*eta_i)/sum(eta_i^2) "
+                           "estimated from the horizontal BPMs at this iteration",
+                           NULL, SDDS_DOUBLE, 0) < 0)) {
+      SDDS_SetError("Unable to set up fast_orbit_feedback RF-phase columns");
+      SDDS_PrintErrors(stderr, SDDS_VERBOSE_PrintErrors | SDDS_EXIT_PrintErrors);
+    }
     if (!SDDS_WriteLayout(&SDDS_fofb)) {
       SDDS_SetError("Unable to write fast_orbit_feedback output layout");
       SDDS_PrintErrors(stderr, SDDS_VERBOSE_PrintErrors | SDDS_EXIT_PrintErrors);
     }
     fofbOutputActive = 1;
     fofbHasDfrfColumn = include_rf_frequency ? 1 : 0;
+    fofbHasPhaseColumns = include_rf_phase ? 1 : 0;
   }
 
   fofbSetupDone = 1;
@@ -727,6 +918,20 @@ long fofbUpdateActuators(LINE_LIST *beamline, RUN *run, long i_pass) {
         changed = 1;
       }
     }
+
+    /* RF-phase energy actuator: a SEPARATE scalar knob (NOT in CM->ncor).  Write
+       rfca->phase = rfBasePhase[k] + phaseCmd on every selected cavity.  Unlike the
+       RF-frequency block this does NOT touch phase_fiducial (t0 = -phase_fiducial/omega
+       is independent of rfca->phase) and does NOT set changed=1: the RFCA live-reads
+       rfca->phase each pass (simple_rfca.c), so no compute_matrix is needed.  Pass 0
+       writes the base phase (phaseCmd=0) so fiducialization happens at the base. */
+    if (plane->rfPhaseActive && plane->phaseCmd != plane->lastPhaseApplied) {
+      long k;
+      for (k = 0; k < plane->nRFPhase; k++)
+        *((double *)(plane->rfPhaseElem[k]->p_elem + plane->rfPhaseOffset[k])) =
+          plane->rfBasePhase[k] + plane->phaseCmd;
+      plane->lastPhaseApplied = plane->phaseCmd;
+    }
   }
   if (changed && beamline->links)
     assert_element_links(beamline->links, run, beamline, DYNAMIC_LINK);
@@ -746,6 +951,8 @@ void fofbStoreBpmTick(ELEMENT_LIST *eptr, double xReading, double yReading) {
       xReading += noise_value(bpm_noise, bpm_noise_cutoff,
                               (bpm_noise_distribution && strncmp(bpm_noise_distribution, "uniform", 7) == 0) ? 2 : 1);
     bd->xTick = bd->nxFilter > 0 ? applyIIRFilter(bd->xFilter, bd->nxFilter, xReading) : xReading;
+    /* same reading (incl. noise) through the RF-loop's own filter, when configured */
+    bd->xTickRF = bd->nxFilterRF > 0 ? applyIIRFilter(bd->xFilterRF, bd->nxFilterRF, xReading) : xReading;
   }
   if (eptr->type == T_VMON || eptr->type == T_MONI) {
     if (bpm_noise)
@@ -761,19 +968,44 @@ void fofbStoreBpmTick(ELEMENT_LIST *eptr, double xReading, double yReading) {
 static void updateSetpoints(FOFB_PLANE *plane, double *rmsOrbit, double *maxCorr, long *nPegged) {
   CORMON_DATA *CM = &plane->CM;
   MAT *Q, *dK;
+  MAT *Q_rf = NULL, *dK_rf = NULL; /* separate solve feeding ONLY the RF-frequency row */
   long i;
   double sum2 = 0, maxc = 0;
   *nPegged = 0;
 
-  /* collect BPM ticks into the orbit vector */
+  /* Dispersion projection delta_est = sum(x_i*eta_i)/sum(eta_i^2) from the RAW x ticks,
+     for the RF-phase energy loop and/or subtract_dispersion (x plane only).  sums->centroid
+     (hence xTick) is already MPI_Allreduce'd, so delta_est is bit-identical on every rank. */
+  if (plane->coord == 0 && (plane->rfPhaseActive || subtract_dispersion)) {
+    double sxe = 0, see = 0;
+    for (i = 0; i < CM->nmon; i++) {
+      void **pp = fofbDataPtr(CM->umoni[i]);
+      FOFB_BPM_DATA *bd = pp ? *pp : NULL;
+      double eta = CM->umoni[i]->twiss ? CM->umoni[i]->twiss->etax : 0;
+      double reading = bd ? bd->xTick : 0;
+      sxe += reading * eta;
+      see += eta * eta;
+    }
+    plane->deltaEst = (see > 0) ? sxe / see : 0;
+  }
+
+  /* collect BPM ticks into the orbit vector.  xBpmRms always reports the RAW orbit; when
+     subtract_dispersion is set the CONTROL vector Q uses the betatron-only residual
+     (x_i - eta_i*delta_est) so the x steering loop need not average out the dispersive
+     synchrotron signal -- that channel is handled by the RF-phase energy actuator. */
   Q = matrix_get(CM->nmon, 1);
   for (i = 0; i < CM->nmon; i++) {
     void **pp = fofbDataPtr(CM->umoni[i]);
     FOFB_BPM_DATA *bd = pp ? *pp : NULL;
-    double reading = 0;
+    double reading = 0, control;
     if (bd)
       reading = plane->coord == 0 ? bd->xTick : bd->yTick;
-    Mij(Q, i, 0) = reading;
+    control = reading;
+    if (plane->coord == 0 && subtract_dispersion) {
+      double eta = CM->umoni[i]->twiss ? CM->umoni[i]->twiss->etax : 0;
+      control -= eta * plane->deltaEst;
+    }
+    Mij(Q, i, 0) = control;
     sum2 += reading * reading;
   }
   *rmsOrbit = CM->nmon ? sqrt(sum2 / CM->nmon) : 0;
@@ -781,9 +1013,24 @@ static void updateSetpoints(FOFB_PLANE *plane, double *rmsOrbit, double *maxCorr
   /* dK = T * Q = -C^-1 * Q : deadbeat correction demand (kick units) */
   dK = matrix_mult(CM->T, Q);
 
+  /* Separate BPM filter for the RF-frequency loop (x plane only): build a second control
+     vector from the RF-filtered ticks and solve with the SAME T, so the RF-frequency row's
+     error comes from an f_s-averaged orbit while the steering rows keep the fast bpm_filter
+     (see dK below).  Collapses to dK exactly when rf_bpm_filter_file is unset. */
+  if (plane->coord == 0 && plane->rfIndex >= 0 && rf_bpm_filter_file) {
+    Q_rf = matrix_get(CM->nmon, 1);
+    for (i = 0; i < CM->nmon; i++) {
+      void **pp = fofbDataPtr(CM->umoni[i]);
+      FOFB_BPM_DATA *bd = pp ? *pp : NULL;
+      Mij(Q_rf, i, 0) = bd ? bd->xTickRF : 0;
+    }
+    dK_rf = matrix_mult(CM->T, Q_rf);
+  }
+
   for (i = 0; i < CM->ncor; i++) {
     double e, d, uProp, uNew, applied, Kp, Ki, Kd, limitVal, limitRef;
     long isRF = (i == plane->rfIndex);
+    MAT *dKsrc = (isRF && dK_rf) ? dK_rf : dK;
     if (isRF) {
       /* RF-frequency class: gains rf_*, and the limit is a detuning about the base
          frequency (|f-f0| <= rf_frequency_limit), not an absolute value. */
@@ -799,7 +1046,9 @@ static void updateSetpoints(FOFB_PLANE *plane, double *rmsOrbit, double *maxCorr
       limitVal = corrector_limit;
       limitRef = 0; /* correctors clamp on the absolute kick */
     }
-    e = Mij(dK, i, 0) / CM->kick_coef[i]; /* parameter-space error (Hz for the RF entry) */
+    /* the RF-frequency row draws its error from the RF-filtered solve when a dedicated
+       rf_bpm_filter_file is configured; steering rows always use the fast-filtered dK */
+    e = Mij(dKsrc, i, 0) / CM->kick_coef[i]; /* param-space error (Hz for the RF entry) */
     d = e - plane->ePrev[i];
     if (!(anti_windup && plane->actPegged[i]))
       plane->Iacc[i] += Ki * e;
@@ -828,6 +1077,41 @@ static void updateSetpoints(FOFB_PLANE *plane, double *rmsOrbit, double *maxCorr
 
   matrix_free(dK);
   matrix_free(Q);
+  if (dK_rf)
+    matrix_free(dK_rf);
+  if (Q_rf)
+    matrix_free(Q_rf);
+}
+
+/* ------------------------------------------------------------------ */
+/* RF-phase energy loop: a scalar PID on the dispersion-projected energy offset
+   delta_est (populated by updateSetpoints), producing the held phase command phaseCmd
+   (deg).  Run once per FOFB iteration, on ALL ranks (the slave holding the particle must
+   apply the phase), right after updateSetpoints for the x plane.  deltaEst and the gains
+   are identical across ranks, so phaseCmd is bit-identical. */
+
+static void updateEnergyLoop(FOFB_PLANE *plane) {
+  double delta, c, cmd, prop;
+  if (!plane->active || !plane->rfPhaseActive)
+    return;
+  delta = plane->deltaEst;
+  /* PID in delta; energy_Ki defaults 0 (DC delta stays the frequency loop's job). */
+  prop = plane->energyKp * delta + plane->energyKd * (delta - plane->ePhasePrev);
+  if (!(anti_windup && plane->phasePegged))
+    plane->ePhaseAcc += plane->energyKi * delta;
+  c = prop + plane->ePhaseAcc;
+  cmd = plane->phaseScale * c; /* sign of phaseScale sets damping vs anti-damping */
+  if (rf_phase_limit > 0 && fabs(cmd) > rf_phase_limit) {
+    double lim = (cmd > 0 ? 1.0 : -1.0) * rf_phase_limit;
+    if (anti_windup && plane->phaseScale != 0)
+      /* back-calculate the integrator so it holds at the clamp (phaseScale maps c->deg) */
+      plane->ePhaseAcc = lim / plane->phaseScale - prop;
+    cmd = lim;
+    plane->phasePegged = 1;
+  } else
+    plane->phasePegged = 0;
+  plane->phaseCmd = cmd;
+  plane->ePhasePrev = delta;
 }
 
 /* ------------------------------------------------------------------ */
@@ -886,6 +1170,8 @@ long doFastOrbitFeedback(RUN *run, VARY *control, LINE_LIST *beamline, BEAM *bea
             resetFilterBank(bd->xFilter, bd->nxFilter);
           if (bd->nyFilter > 0)
             resetFilterBank(bd->yFilter, bd->nyFilter);
+          if (bd->nxFilterRF > 0)
+            resetFilterBank(bd->xFilterRF, bd->nxFilterRF);
         }
       }
     }
@@ -925,8 +1211,10 @@ long doFastOrbitFeedback(RUN *run, VARY *control, LINE_LIST *beamline, BEAM *bea
     passOffset += control->n_passes;
 
     /* run the controller for each active plane */
-    if (planeData[0].active)
+    if (planeData[0].active) {
       updateSetpoints(&planeData[0], &xrms, &xcor, &xpeg);
+      updateEnergyLoop(&planeData[0]); /* RF-phase energy loop (sets phaseCmd for next step) */
+    }
     if (planeData[1].active)
       updateSetpoints(&planeData[1], &yrms, &ycor, &ypeg);
 
@@ -955,6 +1243,15 @@ long doFastOrbitFeedback(RUN *run, VARY *control, LINE_LIST *beamline, BEAM *bea
         if (!SDDS_SetRowValues(&SDDS_fofb, SDDS_SET_BY_NAME | SDDS_PASS_BY_VALUE, 0,
                                "DeltaFrf", dfrf, NULL)) {
           SDDS_SetError("Unable to set fast_orbit_feedback DeltaFrf value");
+          SDDS_PrintErrors(stderr, SDDS_VERBOSE_PrintErrors | SDDS_EXIT_PrintErrors);
+        }
+      }
+      if (fofbHasPhaseColumns) {
+        double dphase = (planeData[0].active && planeData[0].rfPhaseActive) ? planeData[0].phaseCmd : 0.0;
+        double dest = (planeData[0].active && planeData[0].rfPhaseActive) ? planeData[0].deltaEst : 0.0;
+        if (!SDDS_SetRowValues(&SDDS_fofb, SDDS_SET_BY_NAME | SDDS_PASS_BY_VALUE, 0,
+                               "DeltaPhase", dphase, "deltaEnergyEst", dest, NULL)) {
+          SDDS_SetError("Unable to set fast_orbit_feedback RF-phase values");
           SDDS_PrintErrors(stderr, SDDS_VERBOSE_PrintErrors | SDDS_EXIT_PrintErrors);
         }
       }
@@ -999,6 +1296,10 @@ static void freePlane(FOFB_PLANE *plane) {
       freeIIRFilterMemory(bd->yFilter, bd->nyFilter);
       free(bd->yFilter);
     }
+    if (bd->xFilterRF) {
+      freeIIRFilterMemory(bd->xFilterRF, bd->nxFilterRF);
+      free(bd->xFilterRF);
+    }
     free(bd);
     *pp = NULL;
   }
@@ -1026,6 +1327,16 @@ static void freePlane(FOFB_PLANE *plane) {
   plane->rfElem = NULL;
   plane->rfBaseFreq = NULL;
   plane->rfFreqOffset = NULL;
+  if (plane->rfPhaseElem)
+    free(plane->rfPhaseElem);
+  if (plane->rfBasePhase)
+    free(plane->rfBasePhase);
+  if (plane->rfPhaseOffset)
+    free(plane->rfPhaseOffset);
+  plane->rfPhaseElem = NULL;
+  plane->rfBasePhase = NULL;
+  plane->rfPhaseOffset = NULL;
+  plane->rfPhaseActive = 0;
   if (plane->CM.C)
     matrix_free(plane->CM.C);
   if (plane->CM.T)
@@ -1050,6 +1361,20 @@ void finishFastOrbitFeedback(void) {
   }
   fofbOutputActive = 0;
   fofbHasDfrfColumn = 0;
+  fofbHasPhaseColumns = 0;
+
+  /* restore each phase-actuator cavity to its base phase for a clean end state (the
+     RFCA otherwise retains the last commanded offset); do this before freePlane frees
+     the cached arrays.  The RFCA live-reads rfca->phase, so a plain write suffices. */
+  {
+    long ip, k;
+    for (ip = 0; ip < 2; ip++) {
+      FOFB_PLANE *plane = &planeData[ip];
+      if (plane->active && plane->rfPhaseActive && plane->rfPhaseElem)
+        for (k = 0; k < plane->nRFPhase; k++)
+          *((double *)(plane->rfPhaseElem[k]->p_elem + plane->rfPhaseOffset[k])) = plane->rfBasePhase[k];
+    }
+  }
 
   freePlane(&planeData[0]);
   freePlane(&planeData[1]);
@@ -1059,8 +1384,10 @@ void finishFastOrbitFeedback(void) {
   freeSteeringList(&fofbSL[0]);
   freeSteeringList(&fofbSL[1]);
   freeSteeringList(&fofbRFsl);
+  freeSteeringList(&fofbRFPhasesl);
   fofbSLDeclared[0] = fofbSLDeclared[1] = 0;
   fofbRFDeclared = 0;
+  fofbRFPhaseDeclared = 0;
 
   fofbSetupDone = 0;
 }

@@ -13,14 +13,16 @@
 #define SET_ORDER 0
 #define SET_SUPERPERIODICITY 1
 #define SET_INTEGER_TUNES 2
-#define N_OPTIONS 3
+#define SET_POINT_SPACING 3
+#define N_OPTIONS 4
 
 char *option[N_OPTIONS] = {
-  "order", "superperiodicity", "integertunes"};
+  "order", "superperiodicity", "integertunes", "pointspacing"};
 
-#define USAGE "sddsresdiag <outputfile> [-order=<upper>[,<lower>]] [-superperiodicity=<integer>] [-integerTunes=<xvalue>,<yvalue>]\n\
+#define USAGE "sddsresdiag <outputfile> [-order=<upper>[,<lower>]] [-superperiodicity=<integer>] [-integerTunes=<xvalue>,<yvalue>] [-pointSpacing=<value>]\n\
 resdiag makes an mpl format file that can be plotted to make a resonance diagram.\n\
-The resonances are shown up to the order specified (3 is the default).  \n\
+The resonances are shown up to the order specified (3 is the default).\n\
+-pointSpacing forces each line to be emitted as a series of points spaced by <value> in tune units.\n\
 Program by Michael Borland. (This is version 1, October 2002)."
 
 #define FL_LOC_BOTTOM 1
@@ -42,6 +44,7 @@ int main(int argc, char **argv) {
   SCANNED_ARG *scanned;
   long i_arg, type;
   long nux_int, nuy_int;
+  double point_spacing = 0;
 
   argc = scanargs(&scanned, argc, argv);
   if (argc < 2 || argc > (2 + N_OPTIONS))
@@ -79,6 +82,12 @@ int main(int argc, char **argv) {
             sscanf(scanned[i_arg].list[1], "%ld", &nux_int) != 1 || nux_int < 0 ||
             sscanf(scanned[i_arg].list[2], "%ld", &nuy_int) != 1 || nuy_int < 0)
           bomb("invalid -integer_tunes syntax", USAGE);
+        break;
+      case SET_POINT_SPACING:
+        if (scanned[i_arg].n_items != 2 ||
+            sscanf(scanned[i_arg].list[1], "%lf", &point_spacing) != 1 ||
+            point_spacing <= 0)
+          bomb("invalid -pointSpacing syntax", USAGE);
         break;
       default:
         bomb("unknown option given", USAGE);
@@ -196,28 +205,45 @@ int main(int argc, char **argv) {
           fprintf(fp_out, "! %ld NUx +  %ld NUy = %ld        type = %ld\n", j, k, m * n_super, type);
           fprintf(fp_out, "%ld\n", order);
           fprintf(fp_out, "%ld$gn$r$bx$n+%ld$gn$r$by$n=%ld\n", j, k, m * n_super);
-          if (location[0] & FL_LOC_BOTTOM || location[0] & FL_LOC_LEFT)
-            fprintf(fp_out, "%lf %lf\n", nux_int + nuxi[0], nuy_int + nuyi[0]);
-          else if (location[0] & FL_LOC_RIGHT)
-            fprintf(fp_out, "%ld %ld\n%lf %lf\n", nux_int + 1, nuy_int, nux_int + nuxi[0], nuy_int + nuyi[0]);
-          else if (location[0] & FL_LOC_TOP)
-            fprintf(fp_out, "%ld %ld\n%lf %lf\n", nux_int, nuy_int + 1, nux_int + nuxi[0], nuy_int + nuyi[0]);
-          else
-            bomb("unknown location flag for boundary intersection", NULL);
-
-          if (location[1] & FL_LOC_BOTTOM || location[1] & FL_LOC_LEFT)
-            fprintf(fp_out, "%lf %lf\n%ld %ld\n", nux_int + nuxi[1], nuy_int + nuyi[1], nux_int, nuy_int);
-          else if (location[1] & FL_LOC_RIGHT || location[1] & FL_LOC_TOP) {
-            fprintf(fp_out, "%lf %lf\n%lf %lf\n",
-                    nux_int + nuxi[1], nuy_int + nuyi[1], nux_int + nuxi[0], nuy_int + nuyi[0]);
+          if (point_spacing > 0) {
+            /* Emit points along the resonance segment, spaced by point_spacing. */
+            double dx = nuxi[1] - nuxi[0];
+            double dy = nuyi[1] - nuyi[0];
+            double length = sqrt(dx * dx + dy * dy);
+            long npts, ipt;
+            npts = (long)(length / point_spacing) + 1;
+            if (npts < 2)
+              npts = 2;
+            for (ipt = 0; ipt < npts; ipt++) {
+              double t = (double)ipt / (npts - 1);
+              fprintf(fp_out, "%lf %lf\n",
+                      nux_int + nuxi[0] + t * dx,
+                      nuy_int + nuyi[0] + t * dy);
+            }
+          } else {
             if (location[0] & FL_LOC_BOTTOM || location[0] & FL_LOC_LEFT)
-              fprintf(fp_out, "%ld %ld\n", nux_int, nuy_int);
+              fprintf(fp_out, "%lf %lf\n", nux_int + nuxi[0], nuy_int + nuyi[0]);
             else if (location[0] & FL_LOC_RIGHT)
-              fprintf(fp_out, "%ld %ld\n%ld %ld\n", nux_int + 1, nuy_int, nux_int, nuy_int);
+              fprintf(fp_out, "%ld %ld\n%lf %lf\n", nux_int + 1, nuy_int, nux_int + nuxi[0], nuy_int + nuyi[0]);
             else if (location[0] & FL_LOC_TOP)
-              fprintf(fp_out, "%ld %ld\n%ld %ld\n", nux_int, nuy_int + 1, nux_int, nuy_int);
-          } else
-            bomb("unknown location flag for boundary intersection", NULL);
+              fprintf(fp_out, "%ld %ld\n%lf %lf\n", nux_int, nuy_int + 1, nux_int + nuxi[0], nuy_int + nuyi[0]);
+            else
+              bomb("unknown location flag for boundary intersection", NULL);
+
+            if (location[1] & FL_LOC_BOTTOM || location[1] & FL_LOC_LEFT)
+              fprintf(fp_out, "%lf %lf\n%ld %ld\n", nux_int + nuxi[1], nuy_int + nuyi[1], nux_int, nuy_int);
+            else if (location[1] & FL_LOC_RIGHT || location[1] & FL_LOC_TOP) {
+              fprintf(fp_out, "%lf %lf\n%lf %lf\n",
+                      nux_int + nuxi[1], nuy_int + nuyi[1], nux_int + nuxi[0], nuy_int + nuyi[0]);
+              if (location[0] & FL_LOC_BOTTOM || location[0] & FL_LOC_LEFT)
+                fprintf(fp_out, "%ld %ld\n", nux_int, nuy_int);
+              else if (location[0] & FL_LOC_RIGHT)
+                fprintf(fp_out, "%ld %ld\n%ld %ld\n", nux_int + 1, nuy_int, nux_int, nuy_int);
+              else if (location[0] & FL_LOC_TOP)
+                fprintf(fp_out, "%ld %ld\n%ld %ld\n", nux_int, nuy_int + 1, nux_int, nuy_int);
+            } else
+              bomb("unknown location flag for boundary intersection", NULL);
+          }
         }
       }
     }

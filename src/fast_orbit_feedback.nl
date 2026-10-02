@@ -47,9 +47,17 @@
     double bpm_noise_cutoff = 0;
     STRING bpm_noise_distribution = "gaussian";
     long include_rf_frequency = 0;
+    long include_rf_phase = 0;
+    double energy_Kp = 0;
+    double energy_Ki = 0;
+    double energy_Kd = 0;
+    double rf_phase_limit = 0;
+    double energy_response_scale = 0;
+    long subtract_dispersion = 0;
     STRING bpm_filter_file = NULL;
     STRING steering_filter_file = NULL;
     STRING rf_filter_file = NULL;
+    STRING rf_bpm_filter_file = NULL;
     STRING output = NULL;
     long output_interval = 1;
     long center_on_orbit = 0;
