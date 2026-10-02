@@ -261,7 +261,7 @@ long trackThroughExactCorrector(double **part, int64_t n_part, ELEMENT_LIST *ept
 					  0.0, 0.0, 0.0, 0.0, /* effective length already computed in lprod */
 					  lprod,
 					  0.0, /* suppresses FS frame rotation term */
-					  Po,
+					  Po*(1+coord[5]),
 					  -particleCharge*particleRelSign, particleMass, particleAnomalousMagneticMoment);
 	    }
           } else
